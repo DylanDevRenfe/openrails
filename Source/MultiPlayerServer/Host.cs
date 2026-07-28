@@ -1,9 +1,10 @@
-﻿//
+// 
 // Code forked from Open Rails Ultimate (now FreeTrainSimulator)
 //
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO.Pipelines;
 using System.Linq;
 using System.Net;
@@ -13,23 +14,36 @@ using System.Threading.Tasks;
 
 namespace MultiPlayerServer
 {
-    //whoever connects first, will become dispatcher(server) by sending a "SERVER YOU" message
-    //if a clients sends a "SERVER MakeMeServer", this client should be appointed new server
-    //track which clients are leaving - if the client was the server, send a new "SERVER WhoCanBeServer" announcement
-    //if there is no response within xx seconds, appoint a new server by sending "SERVER YOU" to the first/last/random remaining client
+    // Simple disconnected session holder for reconnection window
+    internal class DisconnectedSession
+    {
+        public DateTime DisconnectedAt { get; set; }
+        public byte[] LastKnownBuffer { get; set; }
+        public string SessionToken { get; set; }
+    }
+
     public class Host
     {
         private readonly int port;
 
         private static readonly Encoding encoding = Encoding.Unicode;
         private static readonly int charSize = encoding.GetByteCount("0");
-        private readonly Dictionary<string, TcpClient> onlinePlayers = new Dictionary<string, TcpClient>();
+
+        // thread-safe collection of currently online players
+        private readonly ConcurrentDictionary<string, TcpClient> onlinePlayers = new ConcurrentDictionary<string, TcpClient>();
+
+        // temporarily keep disconnected sessions to allow fast rejoin
+        private readonly ConcurrentDictionary<string, DisconnectedSession> disconnectedSessions = new ConcurrentDictionary<string, DisconnectedSession>();
+
         private static readonly byte[] initData = encoding.GetBytes("10: SERVER YOU");
         private static readonly byte[] serverChallenge = encoding.GetBytes(" 21: SERVER WhoCanBeServer");
         private static readonly byte[] blankToken = encoding.GetBytes(" ");
         private static readonly byte[] playerToken = encoding.GetBytes(": PLAYER ");
         private static readonly byte[] quitToken = encoding.GetBytes(": QUIT ");
         private string currentServer;
+
+        // reconnection window in seconds (configurable)
+        private readonly TimeSpan ReconnectWindow = TimeSpan.FromSeconds(30);
 
         public Host(int port)
         {
@@ -99,8 +113,12 @@ namespace MultiPlayerServer
             await writer.CompleteAsync().ConfigureAwait(false);
         }
 
-        private bool ReadPlayerName(in ReadOnlySequence<byte> sequence, ref string playerName, out SequencePosition bytesProcessed)
+        private bool ReadPlayerName(in ReadOnlySequence<byte> sequence, ref string playerName, out SequencePosition bytesProcessed, out ReadOnlySequence<byte> pendingPlayerMessage)
         {
+            // This method attempts to keep the original parsing behavior but returns any playerMessage
+            // so the async caller can handle sending instead of blocking here.
+            pendingPlayerMessage = ReadOnlySequence<byte>.Empty;
+
             Span<byte> playerSeparator = playerToken.AsSpan();
             Span<byte> blankSeparator = blankToken.AsSpan();
 
@@ -117,7 +135,7 @@ namespace MultiPlayerServer
                         foreach (ReadOnlyMemory<byte> message in before)
                         {
                             if (message.Length > 0)
-                                Broadcast(playerName, message);
+                                BroadcastAsync(playerName, message).ConfigureAwait(false); // fire and forget for preface
                         }
                         reader.Rewind(playerSeparator.Length + playerNameSequence.Length + maxDigits * charSize);
 
@@ -125,13 +143,10 @@ namespace MultiPlayerServer
                         {
                             string newPlayerName = playerNameSequence.GetString(encoding);
                             ReadOnlySequence<byte> playerMessage = reader.Sequence.Slice(before.Length, (length + maxDigits + 2) * charSize);
-                            if (currentServer != playerName)
-                            {
-                                foreach (ReadOnlyMemory<byte> message in playerMessage)
-                                {
-                                    SendMessage(currentServer, message).Wait();
-                                }
-                            }
+
+                            // Return the playerMessage to the caller so it can be sent asynchronously to currentServer
+                            pendingPlayerMessage = playerMessage;
+
                             playerName = newPlayerName;
                             bytesProcessed = sequence.GetPosition(before.Length + playerMessage.Length);
                             return true;
@@ -165,7 +180,7 @@ namespace MultiPlayerServer
             string playerName = tcpClient.Client.RemoteEndPoint.ToString();
             bool playerNameSet = false;
             string quitPlayer;
-            onlinePlayers.Add(playerName, tcpClient);
+            onlinePlayers.TryAdd(playerName, tcpClient);
             if (onlinePlayers.Count == 1)
             {
                 currentServer = playerName;
@@ -181,15 +196,51 @@ namespace MultiPlayerServer
                 if (!playerNameSet)
                 {
                     string player = playerName;
-                    if (ReadPlayerName(buffer, ref player, out SequencePosition bytesProcessed))
+                    if (ReadPlayerName(buffer, ref player, out SequencePosition bytesProcessed, out ReadOnlySequence<byte> pendingPlayerMessage))
                     {
-                        onlinePlayers.Remove(playerName);
-                        if (currentServer == playerName)
-                            currentServer = playerName = player;
-                        else
+                        // if there is a disconnected session for this player, try to reattach
+                        if (disconnectedSessions.TryRemove(player, out var dsession))
+                        {
+                            Console.WriteLine($"Player {player} rejoined within window. Restoring session.");
+                            // remove any old entry keyed by the new name and add new tcp client
+                            onlinePlayers.TryRemove(playerName, out _);
+                            onlinePlayers.TryAdd(player, tcpClient);
+
+                            // notify other players that this player is back
+                            var rejoinMsg = encoding.GetBytes($" {("REJOINED " + player).Length}: {"REJOINED " + player}");
+                            await BroadcastAsync(null, rejoinMsg).ConfigureAwait(false);
+
+                            // ask the current server to send a state snapshot to this player
+                            if (!string.IsNullOrEmpty(currentServer) && currentServer != player)
+                            {
+                                var requestState = encoding.GetBytes($" {("REQUEST_STATE " + player).Length}: {"REQUEST_STATE " + player}");
+                                await SendMessage(currentServer, requestState).ConfigureAwait(false);
+                            }
+
+                            playerNameSet = true;
                             playerName = player;
-                        onlinePlayers.Add(playerName, tcpClient);
-                        playerNameSet = true;
+                        }
+                        else
+                        {
+                            // Normal new-player registration
+                            onlinePlayers.TryRemove(playerName, out _);
+                            if (currentServer == playerName)
+                                currentServer = playerName = player;
+                            else
+                                playerName = player;
+                            onlinePlayers.TryAdd(playerName, tcpClient);
+                            playerNameSet = true;
+
+                            // if there is a pendingPlayerMessage (from the buffered handshake), forward it to current server asynchronously
+                            if (pendingPlayerMessage.Length > 0 && !string.IsNullOrEmpty(currentServer) && currentServer != playerName)
+                            {
+                                foreach (ReadOnlyMemory<byte> message in pendingPlayerMessage)
+                                {
+                                    // send without blocking the reader loop; errors handled inside SendMessage
+                                    _ = SendMessage(currentServer, message);
+                                }
+                            }
+                        }
                     }
                     reader.AdvanceTo(bytesProcessed);
                 }
@@ -198,9 +249,22 @@ namespace MultiPlayerServer
                     if (!string.IsNullOrEmpty(quitPlayer = ReadQuitMessage(buffer)) && playerName == quitPlayer)
                         break;
 
+                    // cache last buffer for quick restore during short disconnects
+                    if (buffer.Length > 0)
+                    {
+                        try
+                        {
+                            var copy = new byte[buffer.Length];
+                            buffer.CopyTo(copy);
+                            disconnectedSessions.AddOrUpdate(playerName, new DisconnectedSession { DisconnectedAt = DateTime.UtcNow, LastKnownBuffer = copy }, (k, v) => { v.LastKnownBuffer = copy; v.DisconnectedAt = DateTime.UtcNow; return v; });
+                        }
+                        catch { }
+                    }
+
                     foreach (ReadOnlyMemory<byte> message in buffer)
                     {
-                        Broadcast(playerName, message);
+                        // propagate message to others
+                        await BroadcastAsync(playerName, message).ConfigureAwait(false);
                     }
                     reader.AdvanceTo(buffer.End);
                 }
@@ -216,27 +280,38 @@ namespace MultiPlayerServer
             await reader.CompleteAsync().ConfigureAwait(false);
         }
 
-        private void Broadcast(string playerName, ReadOnlyMemory<byte> buffer)
+        private async Task BroadcastAsync(string playerName, ReadOnlyMemory<byte> buffer)
         {
             Console.WriteLine(encoding.GetString(buffer.Span).Replace("\r", Environment.NewLine, StringComparison.OrdinalIgnoreCase));
-            Parallel.ForEach(onlinePlayers.Keys, async player =>
+
+            var targets = onlinePlayers.Where(kv => kv.Key != playerName).ToArray();
+            var tasks = new List<Task>(targets.Length);
+
+            foreach (var kv in targets)
             {
-                if (player != playerName)
+                tasks.Add(Task.Run(async () =>
                 {
                     try
                     {
-                        TcpClient client = onlinePlayers[player];
+                        TcpClient client = kv.Value;
                         NetworkStream clientStream = client.GetStream();
                         await clientStream.WriteAsync(buffer).ConfigureAwait(false);
                         await clientStream.FlushAsync().ConfigureAwait(false);
                     }
                     catch (Exception ex) when (ex is System.IO.IOException || ex is SocketException || ex is InvalidOperationException)
                     {
-                        if (playerName != null)
-                            await RemovePlayer(playerName).ConfigureAwait(false);
+                        // If sending fails, schedule removal of that player
+                        Console.WriteLine($"Broadcast failed to {kv.Key}: {ex.Message}");
+                        await RemovePlayer(kv.Key).ConfigureAwait(false);
                     }
-                }
-            });
+                }));
+            }
+
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch { /* individual send errors handled above */ }
         }
 
         private async Task SendMessage(string playerName, ReadOnlyMemory<byte> buffer)
@@ -244,10 +319,24 @@ namespace MultiPlayerServer
             Console.WriteLine(encoding.GetString(buffer.Span).Replace("\r", Environment.NewLine, StringComparison.OrdinalIgnoreCase));
             try
             {
-                TcpClient client = onlinePlayers[playerName];
-                NetworkStream clientStream = client.GetStream();
-                await clientStream.WriteAsync(buffer).ConfigureAwait(false);
-                await clientStream.FlushAsync().ConfigureAwait(false);
+                if (playerName == null)
+                {
+                    // broadcast to everyone
+                    await BroadcastAsync(null, buffer).ConfigureAwait(false);
+                    return;
+                }
+
+                if (onlinePlayers.TryGetValue(playerName, out var client))
+                {
+                    NetworkStream clientStream = client.GetStream();
+                    await clientStream.WriteAsync(buffer).ConfigureAwait(false);
+                    await clientStream.FlushAsync().ConfigureAwait(false);
+                }
+                else
+                {
+                    // player not online - ignore or keep for later
+                    Console.WriteLine($"Attempt to send to offline player {playerName}");
+                }
             }
             catch (Exception ex) when (ex is System.IO.IOException || ex is SocketException || ex is InvalidOperationException)
             {
@@ -258,23 +347,51 @@ namespace MultiPlayerServer
 
         private async Task RemovePlayer(string playerName)
         {
-            if (onlinePlayers.Remove(playerName))
+            if (string.IsNullOrEmpty(playerName)) return;
+
+            if (onlinePlayers.TryRemove(playerName, out var removedClient))
             {
-                string lostMessage = $"LOST { playerName}";
-                byte[] lostPlayer = encoding.GetBytes($" {lostMessage.Length}: {lostMessage}");
-                Broadcast(playerName, lostPlayer);
-                if (currentServer == playerName)
+                // store a short-lived disconnected session to allow quick rejoin
+                try
                 {
-                    Broadcast(playerName, serverChallenge);
-                    await Task.Delay(5000).ConfigureAwait(false);
-                    if (onlinePlayers.Count > 0)
+                    var dsession = new DisconnectedSession { DisconnectedAt = DateTime.UtcNow };
+                    disconnectedSessions[playerName] = dsession;
+
+                    // Broadcast that the player was lost (keep compatibility)
+                    string lostMessage = $"LOST { playerName}";
+                    byte[] lostPlayer = encoding.GetBytes($" {lostMessage.Length}: {lostMessage}");
+                    await BroadcastAsync(playerName, lostPlayer).ConfigureAwait(false);
+
+                    // If player was current server, start server re-election flow
+                    if (currentServer == playerName)
                     {
-                        Broadcast(null, lostPlayer);
-                        currentServer = onlinePlayers.Keys.First();
-                        string appointmentMessage = $"SERVER {currentServer}";
-                        lostPlayer = encoding.GetBytes($" {appointmentMessage.Length}: {appointmentMessage}");
-                        Broadcast(null, lostPlayer);
+                        await BroadcastAsync(playerName, serverChallenge).ConfigureAwait(false);
+                        await Task.Delay(5000).ConfigureAwait(false);
+                        if (onlinePlayers.Count > 0)
+                        {
+                            // appoint first remaining
+                            currentServer = onlinePlayers.Keys.First();
+                            string appointmentMessage = $"SERVER {currentServer}";
+                            lostPlayer = encoding.GetBytes($" {appointmentMessage.Length}: {appointmentMessage}");
+                            await BroadcastAsync(null, lostPlayer).ConfigureAwait(false);
+                        }
                     }
+
+                    // schedule cleanup after ReconnectWindow
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(ReconnectWindow).ConfigureAwait(false);
+                        if (disconnectedSessions.TryGetValue(playerName, out var session) && DateTime.UtcNow - session.DisconnectedAt >= ReconnectWindow)
+                        {
+                            disconnectedSessions.TryRemove(playerName, out _);
+                            Console.WriteLine($"Session for {playerName} expired and was removed.");
+                        }
+                    });
+                }
+                catch { }
+                finally
+                {
+                    try { removedClient?.Close(); } catch { }
                 }
             }
         }
